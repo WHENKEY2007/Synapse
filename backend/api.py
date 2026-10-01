@@ -29,10 +29,18 @@ from backend.intelligence import (
     analyze_claim_semantic_conflict
 )
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db(reset=False)
+    yield
+
 app = FastAPI(
     title="Synapse API — Self-Healing Knowledge Base (Level 3)",
     description="Enterprise production API with JWT authentication, RBAC, semantic vector reasoning, and cryptographic audit provenance.",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -42,6 +50,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 class LoginRequest(BaseModel):
     email: str
