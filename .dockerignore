@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.git/
+.github/
+.vscode/
+.idea/
+*.log
+scratch/
+synapse.db
+synapse.db-wal
+synapse.db-shm

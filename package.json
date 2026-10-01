@@ -1,0 +1,13 @@
+{
+  "name": "synapse",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Synapse — Self-Healing Knowledge Base with Multi-Component Architecture & Reasoning Backend",
+  "scripts": {
+    "dev": "python -m http.server 4173 --bind 127.0.0.1 --directory dist",
+    "dev:backend": "python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000 --reload",
+    "start": "python -m http.server 4173 --bind 127.0.0.1 --directory dist",
+    "start:backend": "python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000",
+    "test:backend": "python -m pytest backend/test_backend.py -v"
+  }
+}

@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  synapse-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: synapse-knowledge-base:2.0.0
+    container_name: synapse-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SYNAPSE_ENV=production
+      - SYNAPSE_PORT=8000
+      - SYNAPSE_JWT_SECRET=${SYNAPSE_JWT_SECRET:-synapse-production-secret-key-2026-png4-secure}
+      - SYNAPSE_DB_PATH=/app/data/synapse.db
+      - SYNAPSE_DEFAULT_AUTO_HEAL_THRESHOLD=95
+    volumes:
+      - synapse-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  synapse-data:
+    driver: local
