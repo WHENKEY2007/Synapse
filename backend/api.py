@@ -8,6 +8,8 @@ Includes Level 3:
 """
 
 import time
+import re
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, Query, status, Depends
@@ -19,15 +21,16 @@ from backend.models import (
 )
 from backend.engine import (
     execute_audit, apply_review_decision, rollback_event, run_evaluation_suite,
-    detect_prompt_injection
+    detect_prompt_injection, can_auto_heal
 )
 from backend.security import (
     verify_password, create_jwt_token, get_current_user, require_roles
 )
 from backend.intelligence import (
     verify_ledger_integrity, compute_calibrated_confidence,
-    analyze_claim_semantic_conflict
+    analyze_claim_semantic_conflict, calculate_event_hash, GENESIS_HASH
 )
+
 
 from contextlib import asynccontextmanager
 
@@ -62,7 +65,15 @@ class AnalyzeClaimRequest(BaseModel):
     owner: str = "Engineering"
     evidence_text: Optional[str] = None
 
+class ImportDocumentRequest(BaseModel):
+    title: str
+    source: str = "Local Upload"
+    owner: str = "Engineering"
+    path: str = "Knowledge / Uploads"
+    text: str
+
 # --- AUTHENTICATION & RBAC ---
+
 
 @app.post("/api/auth/login")
 def login(creds: LoginRequest):
@@ -279,6 +290,192 @@ def ingest_document(doc: Document, user: Dict[str, Any] = Depends(require_roles(
         "reason": reason if is_suspicious else "Ingested successfully",
         "ingested_by": user["name"]
     }
+
+@app.post("/api/documents/import", status_code=status.HTTP_201_CREATED)
+def import_document_and_audit(
+    req: ImportDocumentRequest,
+    user: Dict[str, Any] = Depends(require_roles(["Admin", "Reviewer"]))
+):
+    """
+    Live Document Importer:
+    Ingests raw markdown/text document, performs adversarial injection screening,
+    extracts factual claims, and cross-checks them via subword vector embeddings
+    against the existing enterprise knowledge base. Automatically routes contradictions
+    to Human Review or auto-heals based on configured policy thresholds.
+    """
+    if not req.title.strip() or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Document title and text content are required.")
+
+    # 1. Adversarial prompt injection defense
+    is_suspicious, injection_reason = detect_prompt_injection(req.text)
+    doc_status = "quarantined" if is_suspicious else "healthy"
+
+    conn = get_db_connection()
+    try:
+        with conn:
+            # 2. Determine unique doc ID
+            existing_doc_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            doc_id = f"DOC-{2000 + existing_doc_count + 1}"
+            updated_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+            # 3. Retrieve policy settings for threshold & auto-healing
+            policy = conn.execute("SELECT threshold, auto_heal FROM policies WHERE id = 1").fetchone()
+            threshold = policy["threshold"]
+            auto_heal_enabled = bool(policy["auto_heal"])
+
+            # 4. Fetch existing baseline claims & documents for cross-referencing
+            existing_docs = [dict(r) for r in conn.execute("SELECT id, title, text FROM documents").fetchall()]
+            existing_findings = [dict(r) for r in conn.execute("SELECT id, title, current_claim as text FROM findings").fetchall()]
+            baseline_corpus = existing_docs + existing_findings
+
+            detected_conflicts = []
+            auto_healed_count = 0
+            new_findings = []
+
+            if is_suspicious:
+                # Security quarantine finding
+                f_id = f"CLM-{int(time.time()*1000)%100000}"
+                conn.execute(
+                    """INSERT INTO findings (
+                        id, title, source, path, type, confidence, severity, owner, updated,
+                        current_claim, proposed, evidence, evidence_text, reason, status,
+                        quarantine, evidence_source, applied_text
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        f_id, f"Adversarial instruction in {req.title}", req.source, req.path,
+                        "Unsupported", 99, "High", req.owner, updated_str,
+                        req.text[:200], "[REDACTED - Adversarial Injection Blocked]",
+                        "Security Rule: Prompt injection filter", injection_reason,
+                        injection_reason, "pending", 1, "Synapse Security Filter", None
+                    )
+                )
+                detected_conflicts.append(f_id)
+            else:
+                # 5. Extract substantive sentences/claims from the uploaded document
+                raw_sentences = [s.strip() for s in re.split(r'[\n\.\?!]+', req.text) if len(s.strip()) > 20]
+                
+                for sentence in raw_sentences:
+                    conflicts = analyze_claim_semantic_conflict(sentence, baseline_corpus)
+                    if conflicts:
+                        top = conflicts[0]
+                        # If a contradiction or strong overlap is found
+                        if top.get("type") == "Potential Contradiction" or top.get("similarity_score", 0) >= 0.28:
+                            f_id = f"CLM-{int(time.time()*1000)%100000}-{len(detected_conflicts)+1}"
+                            conf_score = compute_calibrated_confidence(
+                                claim_text=sentence,
+                                evidence_text=top["current_statement"],
+                                owner=req.owner,
+                                is_superseding_policy=True
+                            )
+                            
+                            is_contradiction = (top.get("type") == "Potential Contradiction")
+                            f_type = "Contradiction" if is_contradiction else "Duplicate"
+                            f_severity = "High" if is_contradiction else "Medium"
+                            f_title = f"{f_type} in {req.title}: {top['target_title']}"
+                            f_reason = f"Divergence detected against authoritative record '{top['target_title']}' (similarity: {int(top['similarity_score']*100)}%)."
+                            
+                            finding_dict = {
+                                "id": f_id, "title": f_title, "source": req.source, "path": req.path,
+                                "type": f_type, "confidence": conf_score, "severity": f_severity,
+                                "owner": req.owner, "updated": updated_str, "current": top["current_statement"],
+                                "proposed": sentence, "evidence": f"Uploaded doc: {req.title}",
+                                "evidence_text": sentence, "reason": f_reason, "status": "pending",
+                                "quarantine": False
+                            }
+
+                            # Check if eligible for auto-healing
+                            will_auto_heal = auto_heal_enabled and can_auto_heal(finding_dict, threshold)
+                            status_val = "approved" if will_auto_heal else "pending"
+                            applied_val = sentence if will_auto_heal else None
+
+                            conn.execute(
+                                """INSERT INTO findings (
+                                    id, title, source, path, type, confidence, severity, owner, updated,
+                                    current_claim, proposed, evidence, evidence_text, reason, status,
+                                    quarantine, evidence_source, applied_text
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    f_id, f_title, req.source, req.path, f_type, conf_score,
+                                    f_severity, req.owner, updated_str, top["current_statement"], sentence,
+                                    f"Uploaded doc: {req.title}", sentence, f_reason, status_val,
+                                    0, req.source, applied_val
+                                )
+                            )
+
+                            if will_auto_heal:
+                                auto_healed_count += 1
+                                # Hash-chained ledger entry
+                                event_id = f"EVT-{int(time.time()*1000)}-auto"
+                                now_str = datetime.now(timezone.utc).isoformat()
+                                last_ev = conn.execute("SELECT event_hash FROM history_events ORDER BY rowid DESC LIMIT 1").fetchone()
+                                prev_hash = last_ev["event_hash"] if last_ev and last_ev["event_hash"] else GENESIS_HASH
+                                ev_hash = calculate_event_hash(
+                                    event_id, f_id, "Approved",
+                                    top["current_statement"], sentence, now_str, prev_hash
+                                )
+                                conn.execute(
+                                    """INSERT INTO history_events (
+                                        id, issue_id, title, action, before_text, after_text,
+                                        note, evidence, actor, timestamp, rollback_of, prev_hash, event_hash
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        event_id, f_id, f_title, "Approved",
+                                        top["current_statement"], sentence,
+                                        "Autonomous self-healing applied on document ingestion.",
+                                        f"Uploaded doc: {req.title}", "Synapse Autonomous Importer", now_str,
+                                        None, prev_hash, ev_hash
+                                    )
+                                )
+
+                            detected_conflicts.append(f_id)
+                            new_findings.append({
+                                "id": f_id,
+                                "type": f_type,
+                                "confidence": conf_score,
+                                "status": status_val,
+                                "target_document": top["target_title"],
+                                "current_claim": top["current_statement"],
+                                "proposed_claim": sentence
+                            })
+
+                if detected_conflicts and auto_healed_count < len(detected_conflicts):
+                    doc_status = "review_required"
+
+            # 6. Save newly imported document
+            conn.execute(
+                """INSERT INTO documents (id, title, source, owner, path, updated, status, text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (doc_id, req.title, req.source, req.owner, req.path, updated_str, doc_status, req.text)
+            )
+
+        # Build user-facing message
+        if is_suspicious:
+            msg = f"Document quarantined! Adversarial prompt injection detected: {injection_reason}"
+        elif detected_conflicts:
+            msg = f"Document ingested ({doc_id}). Analyzed claims: {len(detected_conflicts)} conflicts detected ({auto_healed_count} auto-healed, {len(detected_conflicts)-auto_healed_count} routed to Review Queue)."
+        else:
+            msg = f"Document ingested ({doc_id}) with 0 conflicts detected. All claims verified healthy."
+
+        return {
+            "status": "success",
+            "document": {
+                "id": doc_id,
+                "title": req.title,
+                "source": req.source,
+                "owner": req.owner,
+                "path": req.path,
+                "status": doc_status,
+                "updated": updated_str
+            },
+            "quarantined": is_suspicious,
+            "conflicts_detected": len(detected_conflicts),
+            "auto_healed": auto_healed_count,
+            "pending_review": len(detected_conflicts) - auto_healed_count,
+            "findings": new_findings,
+            "message": msg
+        }
+    finally:
+        conn.close()
 
 @app.get("/api/sources")
 def list_sources():
